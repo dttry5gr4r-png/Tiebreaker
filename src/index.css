@@ -1,0 +1,13 @@
+@import "tailwindcss";
+@theme {
+  --font-sans: "Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
+  --color-cream: #fff6e5; --color-ink: #1c1917; --color-tb-orange: #ff6b2c;
+  --color-tb-purple: #7048e8; --color-tb-red: #d62839; --color-tb-sand: #f0dfbf;
+}
+body { background: #1c1917; color: #1c1917; font-family: var(--font-sans); }
+.card { background: #fff; border: 2px solid #1c1917; border-radius: 18px; box-shadow: 3px 4px 0 #1c1917; padding: 14px; }
+.btn { border: 2px solid #1c1917; border-radius: 14px; box-shadow: 2px 3px 0 #1c1917; padding: 8px 14px; font-weight: 800; background: var(--color-tb-sand); }
+.btn:active { transform: translate(2px,3px); box-shadow: none; }
+.btn:focus-visible, .inp:focus-visible { outline: 3px solid var(--color-tb-purple); outline-offset: 2px; }
+.btn-p { background: var(--color-tb-orange); }
+.inp { border: 2px solid #1c1917; border-radius: 14px; padding: 8px 12px; width: 100%; background: var(--color-cream); }
