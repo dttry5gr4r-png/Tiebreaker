@@ -1,6 +1,6 @@
 import type { Handler } from '@netlify/functions'
 import { connectLambda, getStore } from '@netlify/blobs'
-import { randomUUID as uid4, randomBytes, createHash, timingSafeEqual } from 'node:crypto'
+import { randomUUID as uid4, randomBytes, createHash, createHmac, scryptSync, timingSafeEqual } from 'node:crypto'
 import { irv, tally, pickNext } from './logic'
 
 class Err extends Error { constructor(m: string, public code = 400) { super(m) } }
@@ -9,6 +9,25 @@ const clean = (a: any): string[] => [...new Set((Array.isArray(a) ? a : []).map(
 // Recovery code: 80 random bits, shown once, stored only as a hash. Single use (rotated after a reset).
 const newCode = () => randomBytes(10).toString('hex').toUpperCase().match(/.{5}/g)!.join('-')
 const hash = (c: string) => createHash('sha256').update(String(c).toUpperCase().replace(/[^A-Z0-9]/g, '')).digest('hex')
+// Built-in auth: scrypt password hashes + HMAC-signed session tokens. The signing key is generated once and kept in Blobs.
+const hashPw = (p: string) => { const salt = randomBytes(16).toString('hex'); return `${salt}:${scryptSync(p, salt, 32).toString('hex')}` }
+const checkPw = (p: string, st: string) => { const [salt, h] = String(st || ':').split(':'); const a = Buffer.from(h, 'hex'), b = scryptSync(p, salt, 32); return a.length === b.length && timingSafeEqual(a, b) }
+let KEY = ''
+async function key() {
+  if (!KEY) {
+    let k = await get('secret:auth')
+    if (!k) { await S.setJSON('secret:auth', { k: randomBytes(32).toString('hex') }, { onlyIfNew: true }); k = await get('secret:auth') }
+    KEY = k.k
+  }
+  return KEY
+}
+const mac = async (p: string) => createHmac('sha256', await key()).update(p).digest('base64url')
+async function sign(sub: string) { const p = Buffer.from(JSON.stringify({ sub, exp: Date.now() + 30 * 864e5 })).toString('base64url'); return `${p}.${await mac(p)}` }
+async function verify(t: string) {
+  const [p, m] = String(t).split('.'); if (!p || !m) return ''
+  const ok = await mac(p); if (ok.length !== m.length || !timingSafeEqual(Buffer.from(ok), Buffer.from(m))) return ''
+  const d = JSON.parse(Buffer.from(p, 'base64url').toString()); return d.exp > Date.now() ? (d.sub as string) : ''
+}
 let S: ReturnType<typeof getStore>
 const get = (k: string) => S.get(k, { type: 'json' }) as Promise<any>
 
@@ -32,34 +51,42 @@ const result = (mode: string, all: string[][], o: string[]) => (mode === 'ranked
 const view = (p: any, uid: string) => { const { ballots, ...rest } = p; return { ...rest, voted: Object.keys(ballots), myBallot: ballots[uid] } }
 
 const actions: Record<string, (uid: string, b: any, ctx?: any) => Promise<any>> = {
-  async me(uid) { const u = await get(`user:${uid}`); if (u) delete u.recovery; return { me: u || null } },
-  async setUsername(uid, { username }) {
-    const u = String(username || '').trim(), key = u.toLowerCase()
-    must(/^[a-z0-9_.]{3,20}$/i.test(u), 'Use 3-20 letters, numbers, _ or .')
-    must(!(await get(`user:${uid}`)), 'Username already set')
-    const w = await S.setJSON(`uname:${key}`, { uid, username: u }, { onlyIfNew: true })
-    must(w.modified, 'Username already taken')
+  async me(uid) { const u = await get(`user:${uid}`); if (u) for (const f of ['pw', 'recovery', 'fails', 'lockUntil']) delete u[f]; return { me: u || null } },
+  async signup(_u, { username, password }) {
+    const name = String(username || '').trim(), k = name.toLowerCase(), pw = String(password || '')
+    must(/^[a-z0-9_.]{3,20}$/i.test(name), 'Username: 3-20 letters, numbers, _ or .')
+    must(pw.length >= 6 && pw.length <= 200, 'Password needs 6+ characters')
+    const uid = uid4()
+    must((await S.setJSON(`uname:${k}`, { uid, username: name }, { onlyIfNew: true })).modified, 'Username already taken')
     const code = newCode()
-    await S.setJSON(`user:${uid}`, { uid, username: u, groups: [], recovery: hash(code) })
-    return { ok: true, recoveryCode: code }
+    await S.setJSON(`user:${uid}`, { uid, username: name, groups: [], pw: hashPw(pw), recovery: hash(code) })
+    return { token: await sign(uid), recoveryCode: code }
+  },
+  async login(_u, { username, password }) {
+    const t = await get(`uname:${String(username || '').trim().toLowerCase()}`)
+    const u = t && (await get(`user:${t.uid}`))
+    must(!u?.lockUntil || u.lockUntil < Date.now(), 'Too many tries. Wait a minute.', 429)
+    if (!u || !checkPw(String(password || ''), u.pw)) {
+      if (u) await mutate(`user:${t.uid}`, x => { x.fails = (x.fails || 0) + 1; if (x.fails >= 5) { x.fails = 0; x.lockUntil = Date.now() + 60000 } return x })
+      throw new Err('Wrong username or password', 403)
+    }
+    if (u.fails) await mutate(`user:${t.uid}`, x => ({ ...x, fails: 0 }))
+    return { token: await sign(t.uid) }
   },
   async newRecoveryCode(uid) {
     const code = newCode()
     await mutate(`user:${uid}`, u => ({ ...u, recovery: hash(code) }))
     return { recoveryCode: code }
   },
-  async recover(_uid, { username, code, password }, ctx) {
+  async recover(_u, { username, code, password }) {
     const t = await get(`uname:${String(username || '').trim().toLowerCase()}`)
     const u = t && (await get(`user:${t.uid}`))
     const a = Buffer.from(u?.recovery || ''), b = Buffer.from(hash(code || ''))
     must(u?.recovery && a.length === b.length && timingSafeEqual(a, b), 'Username or recovery code is wrong', 403)
-    must(String(password || '').length >= 6, 'Password needs 6+ characters')
-    const id = ctx?.clientContext?.identity; must(id, 'Identity is not enabled', 500)
-    const r = await fetch(`${id.url}/admin/users/${t.uid}`, { method: 'PUT', headers: { Authorization: `Bearer ${id.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) })
-    must(r.ok, 'Could not reset password', 500)
+    const pw = String(password || ''); must(pw.length >= 6 && pw.length <= 200, 'Password needs 6+ characters')
     const rc = newCode()
-    await mutate(`user:${t.uid}`, x => ({ ...x, recovery: hash(rc) }))
-    return { recoveryCode: rc }
+    await mutate(`user:${t.uid}`, x => ({ ...x, pw: hashPw(pw), recovery: hash(rc), fails: 0, lockUntil: 0 }))
+    return { token: await sign(t.uid), recoveryCode: rc }
   },
   async searchUsers(_uid, { q }) {
     const k = String(q || '').toLowerCase().replace(/^@/, '')
@@ -168,15 +195,15 @@ const actions: Record<string, (uid: string, b: any, ctx?: any) => Promise<any>> 
   }
 }
 
-export const handler: Handler = async (e, ctx) => {
+export const handler: Handler = async e => {
   try {
     connectLambda(e as any)
     S = getStore({ name: 'tiebreaker', consistency: 'strong' })
     must(e.httpMethod === 'POST', 'POST only', 405)
-    const user = (ctx as any).clientContext?.user
     const name = e.path.split('/').pop()!, fn = actions[name]; must(fn, 'Unknown action', 404)
-    if (name !== 'recover') must(user?.sub, 'Unauthorized', 401)
-    return { statusCode: 200, body: JSON.stringify(await fn(user?.sub, JSON.parse(e.body || '{}'), ctx)) }
+    let uid = ''
+    if (!['signup', 'login', 'recover'].includes(name)) { uid = await verify((e.headers.authorization || '').replace('Bearer ', '')); must(uid, 'Unauthorized', 401) }
+    return { statusCode: 200, body: JSON.stringify(await fn(uid, JSON.parse(e.body || '{}'))) }
   } catch (err: any) {
     return { statusCode: err.code || 500, body: JSON.stringify({ error: err.code ? err.message : 'Server error' }) }
   }
