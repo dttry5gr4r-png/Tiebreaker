@@ -1,11 +1,14 @@
 import type { Handler } from '@netlify/functions'
 import { connectLambda, getStore } from '@netlify/blobs'
-import { randomUUID as uid4 } from 'node:crypto'
+import { randomUUID as uid4, randomBytes, createHash, timingSafeEqual } from 'node:crypto'
 import { irv, tally, pickNext } from './logic'
 
 class Err extends Error { constructor(m: string, public code = 400) { super(m) } }
 const must = (c: any, m: string, code = 400) => { if (!c) throw new Err(m, code) }
 const clean = (a: any): string[] => [...new Set((Array.isArray(a) ? a : []).map((s: any) => String(s).trim()).filter(Boolean))].slice(0, 50) as string[]
+// Recovery code: 80 random bits, shown once, stored only as a hash. Single use (rotated after a reset).
+const newCode = () => randomBytes(10).toString('hex').toUpperCase().match(/.{5}/g)!.join('-')
+const hash = (c: string) => createHash('sha256').update(String(c).toUpperCase().replace(/[^A-Z0-9]/g, '')).digest('hex')
 let S: ReturnType<typeof getStore>
 const get = (k: string) => S.get(k, { type: 'json' }) as Promise<any>
 
@@ -28,16 +31,35 @@ const log = (g: any, text: string) => { g.activity = [...g.activity, { text, at:
 const result = (mode: string, all: string[][], o: string[]) => (mode === 'ranked' ? irv(all, o) : tally(all, o))
 const view = (p: any, uid: string) => { const { ballots, ...rest } = p; return { ...rest, voted: Object.keys(ballots), myBallot: ballots[uid] } }
 
-const actions: Record<string, (uid: string, b: any) => Promise<any>> = {
-  async me(uid) { return { me: (await get(`user:${uid}`)) || null } },
+const actions: Record<string, (uid: string, b: any, ctx?: any) => Promise<any>> = {
+  async me(uid) { const u = await get(`user:${uid}`); if (u) delete u.recovery; return { me: u || null } },
   async setUsername(uid, { username }) {
     const u = String(username || '').trim(), key = u.toLowerCase()
     must(/^[a-z0-9_.]{3,20}$/i.test(u), 'Use 3-20 letters, numbers, _ or .')
     must(!(await get(`user:${uid}`)), 'Username already set')
     const w = await S.setJSON(`uname:${key}`, { uid, username: u }, { onlyIfNew: true })
     must(w.modified, 'Username already taken')
-    await S.setJSON(`user:${uid}`, { uid, username: u, groups: [] })
-    return { ok: true }
+    const code = newCode()
+    await S.setJSON(`user:${uid}`, { uid, username: u, groups: [], recovery: hash(code) })
+    return { ok: true, recoveryCode: code }
+  },
+  async newRecoveryCode(uid) {
+    const code = newCode()
+    await mutate(`user:${uid}`, u => ({ ...u, recovery: hash(code) }))
+    return { recoveryCode: code }
+  },
+  async recover(_uid, { username, code, password }, ctx) {
+    const t = await get(`uname:${String(username || '').trim().toLowerCase()}`)
+    const u = t && (await get(`user:${t.uid}`))
+    const a = Buffer.from(u?.recovery || ''), b = Buffer.from(hash(code || ''))
+    must(u?.recovery && a.length === b.length && timingSafeEqual(a, b), 'Username or recovery code is wrong', 403)
+    must(String(password || '').length >= 6, 'Password needs 6+ characters')
+    const id = ctx?.clientContext?.identity; must(id, 'Identity is not enabled', 500)
+    const r = await fetch(`${id.url}/admin/users/${t.uid}`, { method: 'PUT', headers: { Authorization: `Bearer ${id.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) })
+    must(r.ok, 'Could not reset password', 500)
+    const rc = newCode()
+    await mutate(`user:${t.uid}`, x => ({ ...x, recovery: hash(rc) }))
+    return { recoveryCode: rc }
   },
   async searchUsers(_uid, { q }) {
     const k = String(q || '').toLowerCase().replace(/^@/, '')
@@ -152,9 +174,9 @@ export const handler: Handler = async (e, ctx) => {
     S = getStore({ name: 'tiebreaker', consistency: 'strong' })
     must(e.httpMethod === 'POST', 'POST only', 405)
     const user = (ctx as any).clientContext?.user
-    must(user?.sub, 'Unauthorized', 401)
-    const fn = actions[e.path.split('/').pop()!]; must(fn, 'Unknown action', 404)
-    return { statusCode: 200, body: JSON.stringify(await fn(user.sub, JSON.parse(e.body || '{}'))) }
+    const name = e.path.split('/').pop()!, fn = actions[name]; must(fn, 'Unknown action', 404)
+    if (name !== 'recover') must(user?.sub, 'Unauthorized', 401)
+    return { statusCode: 200, body: JSON.stringify(await fn(user?.sub, JSON.parse(e.body || '{}'), ctx)) }
   } catch (err: any) {
     return { statusCode: err.code || 500, body: JSON.stringify({ error: err.code ? err.message : 'Server error' }) }
   }
