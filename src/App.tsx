@@ -21,7 +21,7 @@ export default function App() {
   const [route, setRoute] = useState<{ g?: string; p?: string }>({})
   return (
     <div className="mx-auto min-h-screen max-w-md bg-cream p-5 pb-16">
-      {!user ? <Auth /> : code ? <Code code={code} done={clearCode} /> : !meR ? null : !me ? <Username /> : route.p ? <Poll gid={route.g!} pid={route.p} uid={getUid()} back={() => setRoute({ g: route.g })} />
+      {!user ? <Auth /> : code ? <Code code={code} done={clearCode} /> : !me ? null : route.p ? <Poll gid={route.g!} pid={route.p} uid={getUid()} back={() => setRoute({ g: route.g })} />
         : route.g ? <Group gid={route.g} me={me} uid={getUid()} open={p => setRoute({ g: route.g, p })} back={() => setRoute({})} />
         : <Home me={me} uid={getUid()} open={g => setRoute({ g })} />}
     </div>
@@ -59,19 +59,6 @@ function Code({ code, done }: { code: string; done: () => void }) {
       <div className="card select-all text-center text-xl font-extrabold tracking-wider">{code}</div>
       <button className="btn w-full" onClick={() => navigator.clipboard?.writeText(code)}>Copy code</button>
       <button className="btn btn-p w-full" onClick={done}>I've saved it</button>
-    </div>
-  )
-}
-
-function Username() {
-  const [u, setU] = useState(''), { err, run } = useAct()
-  return (
-    <div className="pt-16 space-y-3">
-      <h1 className="text-3xl font-extrabold">Pick a username</h1>
-      <p className="text-stone-600">Friends use it to invite you to groups.</p>
-      <input className="inp" placeholder="@username" value={u} onChange={e => setU(e.target.value.replace('@', ''))} />
-      <button className="btn btn-p w-full" onClick={() => run('setUsername', { username: u })}>Save username</button>
-      <Err m={err} />
     </div>
   )
 }
