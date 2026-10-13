@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { api, useApi, useAuth, getUid, login, signup, logout } from './api'
+import { api, useApi, useAuth, useCode, getUid, login, signup, recover, logout } from './api'
 
 const lines = (t: string) => t.split('\n').map(x => x.trim()).filter(Boolean)
 
@@ -15,12 +15,13 @@ const Err = ({ m }: { m: string }) => (m ? <p role="alert" className="text-tb-re
 
 export default function App() {
   const user = useAuth()
+  const [code, clearCode] = useCode()
   const meR = useApi<{ me: any }>('me', {}, [user], user)
   const me = meR?.me
   const [route, setRoute] = useState<{ g?: string; p?: string }>({})
   return (
     <div className="mx-auto min-h-screen max-w-md bg-cream p-5 pb-16">
-      {!user ? <Auth /> : !meR ? null : !me ? <Username /> : route.p ? <Poll gid={route.g!} pid={route.p} uid={getUid()} back={() => setRoute({ g: route.g })} />
+      {!user ? <Auth /> : code ? <Code code={code} done={clearCode} /> : !meR ? null : !me ? <Username /> : route.p ? <Poll gid={route.g!} pid={route.p} uid={getUid()} back={() => setRoute({ g: route.g })} />
         : route.g ? <Group gid={route.g} me={me} uid={getUid()} open={p => setRoute({ g: route.g, p })} back={() => setRoute({})} />
         : <Home me={me} uid={getUid()} open={g => setRoute({ g })} />}
     </div>
@@ -28,19 +29,36 @@ export default function App() {
 }
 
 function Auth() {
-  const [email, setE] = useState(''), [pw, setP] = useState(''), [mode, setM] = useState<'in' | 'up'>('in'), [err, setErr] = useState('')
+  const [name, setN] = useState(''), [pw, setP] = useState(''), [rc, setRc] = useState(''), [mode, setM] = useState<'in' | 'up' | 'reset'>('in'), [err, setErr] = useState('')
   const go = async () => {
-    try { await (mode === 'in' ? login(email, pw) : signup(email, pw)) } catch (e: any) { setErr(e.message) }
+    setErr('')
+    try { await (mode === 'in' ? login(name, pw) : mode === 'up' ? signup(name, pw) : recover(name, rc, pw)) } catch (e: any) { setErr(e.message) }
   }
+  const sw = (m: 'in' | 'up' | 'reset', t: string) => <button className="block underline text-sm" onClick={() => { setM(m); setErr('') }}>{t}</button>
   return (
     <div className="pt-16 space-y-3">
       <h1 className="text-5xl font-extrabold">Tiebreaker</h1>
-      <p className="text-stone-600">Settle it with your group. Fairly.</p>
-      <input className="inp" type="email" placeholder="Email" value={email} onChange={e => setE(e.target.value)} />
-      <input className="inp" type="password" placeholder="Password (6+ characters)" value={pw} onChange={e => setP(e.target.value)} />
-      <button className="btn btn-p w-full" onClick={go}>{mode === 'in' ? 'Log in' : 'Create account'}</button>
-      <button className="underline text-sm" onClick={() => setM(mode === 'in' ? 'up' : 'in')}>{mode === 'in' ? 'New here? Sign up' : 'Have an account? Log in'}</button>
+      <p className="text-stone-600">{mode === 'reset' ? 'Reset your password with your recovery code.' : 'Settle it with your group. Fairly.'}</p>
+      <input className="inp" placeholder="Username" autoComplete="username" autoCapitalize="none" value={name} onChange={e => setN(e.target.value.replace('@', ''))} />
+      {mode === 'reset' && <input className="inp" placeholder="Recovery code (XXXXX-XXXXX-XXXXX-XXXXX)" autoCapitalize="characters" value={rc} onChange={e => setRc(e.target.value)} />}
+      <input className="inp" type="password" placeholder={mode === 'reset' ? 'New password (6+ characters)' : 'Password (6+ characters)'} autoComplete={mode === 'in' ? 'current-password' : 'new-password'} value={pw} onChange={e => setP(e.target.value)} />
+      <button className="btn btn-p w-full" onClick={go}>{mode === 'in' ? 'Log in' : mode === 'up' ? 'Create account' : 'Reset password'}</button>
+      {mode !== 'in' && sw('in', 'Back to log in')}
+      {mode === 'in' && sw('up', 'New here? Sign up')}
+      {mode === 'in' && sw('reset', 'Forgot password?')}
       <Err m={err} />
+    </div>
+  )
+}
+
+function Code({ code, done }: { code: string; done: () => void }) {
+  return (
+    <div className="pt-16 space-y-3">
+      <h1 className="text-3xl font-extrabold">Save your recovery code</h1>
+      <p className="text-stone-600">This is the only way to reset your password. It is shown once. Store it somewhere safe.</p>
+      <div className="card select-all text-center text-xl font-extrabold tracking-wider">{code}</div>
+      <button className="btn w-full" onClick={() => navigator.clipboard?.writeText(code)}>Copy code</button>
+      <button className="btn btn-p w-full" onClick={done}>I've saved it</button>
     </div>
   )
 }
@@ -65,7 +83,10 @@ function Home({ me, uid, open }: { me: any; uid: string; open: (g: string) => vo
     <div className="space-y-5">
       <header className="flex items-center justify-between">
         <h1 className="text-3xl font-extrabold">Hey, @{me.username}</h1>
-        <button className="btn" onClick={() => logout()}>Log out</button>
+        <div className="flex gap-2">
+          <button className="btn" onClick={() => window.confirm('This replaces your old recovery code. Continue?') && api('newRecoveryCode').catch(() => {})}>New recovery code</button>
+          <button className="btn" onClick={() => logout()}>Log out</button>
+        </div>
       </header>
       {invites.length > 0 && <section className="space-y-2"><h2 className="text-xl font-extrabold">Pending invites</h2>
         {invites.map(i => (
